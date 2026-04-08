@@ -6,12 +6,13 @@ import json
 import asyncio
 import uuid
 import os
+import time
 import logging
-from typing import Optional
+from typing import Optional, Any, AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 
 # ============================================================
 #  配置区
@@ -127,6 +128,231 @@ def _build_user_text(messages: list,system_prompt) -> str:
     return current_text
 
 
+def _extract_text_and_files(content: Any) -> tuple[str, list[dict]]:
+    """提取文本与附件，兼容 OpenAI/Anthropic 的 content 结构。"""
+    texts: list[str] = []
+    files: list[dict] = []
+
+    if isinstance(content, str):
+        return content, files
+
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, str):
+                texts.append(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+            if item_type == "text":
+                text_value = item.get("text", "")
+                if isinstance(text_value, str):
+                    texts.append(text_value)
+            elif item_type == "file" and isinstance(item.get("file"), dict):
+                file_info = item["file"]
+                files.append({
+                    "name": file_info.get("filename", "unknown"),
+                    "data": file_info.get("file_data", ""),
+                })
+            elif item_type in ("image", "document") and isinstance(item.get("source"), dict):
+                source = item["source"]
+                data = source.get("data", "")
+                if data:
+                    media_type = source.get("media_type", "application/octet-stream")
+                    suffix = str(media_type).split("/")[-1] if "/" in str(media_type) else "bin"
+                    files.append({"name": f"{item_type}.{suffix}", "data": data})
+
+    return "\n".join(texts), files
+
+
+def _normalize_openai_messages(messages: list) -> tuple[list, list[dict]]:
+    """标准化 OpenAI 消息格式，并收集附件。"""
+    normalized: list = []
+    files: list[dict] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        text, msg_files = _extract_text_and_files(msg.get("content", ""))
+        files.extend(msg_files)
+        normalized.append({
+            "role": msg.get("role", "user"),
+            "content": text,
+        })
+
+    return normalized, files
+
+
+def _anthropic_system_to_text(system_value: Any) -> str:
+    """把 Anthropic 的 system 字段统一成字符串。"""
+    if isinstance(system_value, str):
+        return system_value
+    if isinstance(system_value, dict):
+        if system_value.get("type") == "text":
+            return str(system_value.get("text", ""))
+        return ""
+    if isinstance(system_value, list):
+        parts: list[str] = []
+        for item in system_value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+        return "\n".join([p for p in parts if p])
+    return ""
+
+
+def _normalize_anthropic_messages(messages: list) -> tuple[list, list[dict]]:
+    """标准化 Anthropic 消息格式，并收集附件。"""
+    normalized: list = []
+    files: list[dict] = []
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        text, msg_files = _extract_text_and_files(msg.get("content", ""))
+        files.extend(msg_files)
+        normalized.append({
+            "role": msg.get("role", "user"),
+            "content": text,
+        })
+
+    return normalized, files
+
+
+def _anthropic_usage_from_openai(usage: Optional[dict]) -> dict:
+    """将 OpenAI usage 字段映射到 Anthropic usage。"""
+    usage = usage or {}
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    return {
+        "input_tokens": prompt_tokens,
+        "output_tokens": completion_tokens,
+    }
+
+
+def _anthropic_sse(event: str, payload: dict) -> str:
+    """包装 Anthropic SSE 事件。"""
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _proxy_chat_events(
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    files: list[dict],
+) -> AsyncGenerator[dict, None]:
+    """统一的上游事件流，向下游输出 content/reasoning/usage/error 事件。"""
+    selected_session_id = None
+    try:
+        selected_session_id = await session_pool.get()
+        logger.info("分配 session_id=%d", selected_session_id)
+
+        t0 = time.time()
+        session_result = await change_session(
+            target_session_id=selected_session_id,
+            model=model,
+            system_prompt=system_prompt,
+        )
+        if session_result.get("code") != 0:
+            yield {
+                "type": "error",
+                "data": f"upstream session update failed (sessionId={selected_session_id}): {session_result.get('msg', 'unknown')}",
+            }
+            return
+
+        t1 = time.time()
+        logger.info("修改上游会话配置耗时: %.3f 秒", t1 - t0)
+        await asyncio.sleep(0.1)
+
+        payload = {"sessionId": selected_session_id, "text": user_text, "files": files}
+        t2 = time.time()
+        async with httpx.AsyncClient(**_client_kwargs(CHAT_TIMEOUT)) as client:
+            async with client.stream("POST", f"{BASE_URL}/chat/completions", headers=_headers(), json=payload) as resp:
+                if resp.status_code != 200:
+                    upstream_body = (await resp.aread()).decode("utf-8", errors="ignore")
+                    raise RuntimeError(f"upstream completions http {resp.status_code}: {upstream_body[:300]}")
+
+                logger.info("上游接通耗时 (TTFB 之前/建连等): %.3f 秒", time.time() - t2)
+                buffer = ""
+                is_thinking = False
+                first_chunk = True
+
+                try:
+                    async for raw_bytes in resp.aiter_bytes():
+                        if first_chunk:
+                            logger.info("首字节到达耗时 (TTFB): %.3f 秒", time.time() - t2)
+                            first_chunk = False
+                        buffer += raw_bytes.decode("utf-8", errors="ignore")
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            raw_str = line[5:].strip()
+                            if raw_str == "[DONE]":
+                                break
+
+                            try:
+                                obj = json.loads(raw_str)
+                            except json.JSONDecodeError:
+                                continue
+
+                            if obj.get("err"):
+                                err_msg = obj.get("err")
+                                yield {
+                                    "type": "content",
+                                    "data": "\n[上游由于配置或模型限制报错: " + err_msg + "]\n",
+                                }
+                                continue
+
+                            if obj.get("type") == "string":
+                                text = obj.get("data", "")
+                            elif obj.get("type") in ("object", "stats"):
+                                d = obj.get("data", {})
+                                usage = {
+                                    "prompt_tokens": d.get("promptTokens", 0),
+                                    "completion_tokens": d.get("completionTokens", 0),
+                                    "total_tokens": d.get("promptTokens", 0) + d.get("completionTokens", 0),
+                                }
+                                yield {"type": "usage", "data": usage}
+                                continue
+                            else:
+                                continue
+
+                            if not text:
+                                continue
+
+                            if "<think>" in text:
+                                is_thinking = True
+                                text = text.replace("<think>", "")
+                            if "</think>" in text:
+                                parts = text.split("</think>")
+                                if parts[0]:
+                                    yield {"type": "reasoning", "data": parts[0]}
+                                is_thinking = False
+                                text = parts[1] if len(parts) > 1 else ""
+
+                            if text:
+                                if is_thinking:
+                                    yield {"type": "reasoning", "data": text}
+                                else:
+                                    yield {"type": "content", "data": text}
+                except httpx.RemoteProtocolError:
+                    logger.warning("上游连接提前关闭 (incomplete chunked read)，已收集的数据仍有效")
+
+    except Exception as e:
+        logger.error("生成异常: %r", e)
+        yield {"type": "error", "data": str(e) or repr(e)}
+    finally:
+        if selected_session_id is not None:
+            session_pool.put_nowait(selected_session_id)
+            logger.info("归还 session_id=%d", selected_session_id)
+
+
 # ============================================================
 #  上游交互
 # ============================================================
@@ -228,26 +454,10 @@ async def chat_completions(request: Request):
     """OpenAI 兼容的对话补全接口（流式/非流式）"""
     body = await request.json()
     model = body.get("model", DEFAULT_MODEL)
-    messages = body.get("messages", [])
+    messages_raw = body.get("messages", [])
     is_stream = body.get("stream", False)
 
-    # 提取附件
-    files = []
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            new_content = []
-            for item in msg["content"]:
-                if isinstance(item, dict) and item.get("type") == "file" and item.get("file"):
-                    file_info = item.get("file")
-                    files.append({
-                        "name": file_info.get("filename", "unknown"),
-                        "data": file_info.get("file_data", "")
-                    })
-                elif isinstance(item, dict) and item.get("type") == "text":
-                    new_content.append(item.get("text", ""))
-                elif isinstance(item, str):
-                    new_content.append(item)
-            msg["content"] = "\n".join(new_content)
+    messages, files = _normalize_openai_messages(messages_raw)
 
     # 提取 system prompt（如果第一条是 system 角色）
     system_prompt = ""
@@ -260,121 +470,16 @@ async def chat_completions(request: Request):
         return {"error": {"message": "无法解析用户消息"}}
 
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-
-    import time
     created_time = int(time.time())
-
-    async def _event_generator():
-        selected_session_id = None
-        try:
-            selected_session_id = await session_pool.get()
-            logger.info("分配 session_id=%d", selected_session_id)
-
-            t0 = time.time()
-            # 1. 修改上游会话配置
-            session_result = await change_session(
-                target_session_id=selected_session_id,
-                model=model,
-                system_prompt=system_prompt,
-            )
-            if session_result.get("code") != 0:
-                yield {
-                    "type": "error",
-                    "data": f"upstream session update failed (sessionId={selected_session_id}): {session_result.get('msg', 'unknown')}",
-                }
-                return
-            t1 = time.time()
-            logger.info(f"修改上游会话配置耗时: {t1 - t0:.3f} 秒")
-            await asyncio.sleep(0.1)  # 等待配置生效
-
-            # 2. 发起流式聊天请求
-            payload = {"sessionId": selected_session_id, "text": user_text, "files": files}
-            t2 = time.time()
-            async with httpx.AsyncClient(**_client_kwargs(CHAT_TIMEOUT)) as client:
-                async with client.stream("POST", f"{BASE_URL}/chat/completions", headers=_headers(), json=payload) as resp:
-                    if resp.status_code != 200:
-                        upstream_body = (await resp.aread()).decode("utf-8", errors="ignore")
-                        raise RuntimeError(f"upstream completions http {resp.status_code}: {upstream_body[:300]}")
-
-                    logger.info(f"上游接通耗时 (TTFB 之前/建连等): {time.time() - t2:.3f} 秒")
-                    buffer = ""
-                    is_thinking = False
-                    first_chunk = True
-
-                    try:
-                        async for raw_bytes in resp.aiter_bytes():
-                            if first_chunk:
-                                logger.info(f"首字节到达耗时 (TTFB): {time.time() - t2:.3f} 秒")
-                                first_chunk = False
-                            buffer += raw_bytes.decode("utf-8", errors="ignore")
-                            while "\n" in buffer:
-                                line, buffer = buffer.split("\n", 1)
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                if not line.startswith("data:"):
-                                    continue
-                                raw_str = line[5:].strip()
-                                if raw_str == "[DONE]":
-                                    break
-
-                                try:
-                                    obj = json.loads(raw_str)
-                                except json.JSONDecodeError:
-                                    continue
-
-                                # --- 错误处理 ---
-                                if obj.get("err"):
-                                    err_msg = obj.get("err")
-                                    yield {"type": "content", "data": "\n[上游由于配置或模型限制报错: " + err_msg + "]\n"}
-                                    continue
-                                if obj.get("type") == "string":
-                                    text = obj.get("data", "")
-                                elif obj.get("type") in ("object", "stats"):
-                                    d = obj.get("data", {})
-                                    usage = {
-                                        "prompt_tokens": d.get("promptTokens", 0),
-                                        "completion_tokens": d.get("completionTokens", 0),
-                                        "total_tokens": d.get("promptTokens", 0) + d.get("completionTokens", 0),
-                                    }
-                                    yield {"type": "usage", "data": usage}
-                                    continue
-                                else:
-                                    continue
-
-                                if not text:
-                                    continue
-
-                                # 处理 <think> 标签 (DeepSeek 等推理模型)
-                                if "<think>" in text:
-                                    is_thinking = True
-                                    text = text.replace("<think>", "")
-                                if "</think>" in text:
-                                    parts = text.split("</think>")
-                                    if parts[0]:
-                                        yield {"type": "reasoning", "data": parts[0]}
-                                    is_thinking = False
-                                    text = parts[1] if len(parts) > 1 else ""
-
-                                if text:
-                                    if is_thinking:
-                                        yield {"type": "reasoning", "data": text}
-                                    else:
-                                        yield {"type": "content", "data": text}
-                    except httpx.RemoteProtocolError:
-                        logger.warning("上游连接提前关闭 (incomplete chunked read)，已收集的数据仍有效")
-
-        except Exception as e:
-            logger.error("生成异常: %r", e)
-            yield {"type": "error", "data": str(e) or repr(e)}
-        finally:
-            if selected_session_id is not None:
-                session_pool.put_nowait(selected_session_id)
-                logger.info("归还 session_id=%d", selected_session_id)
 
     if is_stream:
         async def stream_generator():
-            async for event in _event_generator():
+            async for event in _proxy_chat_events(
+                model=model,
+                system_prompt=system_prompt,
+                user_text=user_text,
+                files=files,
+            ):
                 if event["type"] == "content":
                     yield _wrap_chunk(model, chunk_id, content=event["data"])
                 elif event["type"] == "reasoning":
@@ -388,7 +493,6 @@ async def chat_completions(request: Request):
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
     else:
         # 非流式处理
-        from fastapi.responses import JSONResponse
         full_content = ""
         full_reasoning = ""
         final_usage = {
@@ -397,7 +501,12 @@ async def chat_completions(request: Request):
             "total_tokens": 0
         }
         
-        async for event in _event_generator():
+        async for event in _proxy_chat_events(
+            model=model,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            files=files,
+        ):
             if event["type"] == "content":
                 full_content += event["data"]
             elif event["type"] == "reasoning":
@@ -423,6 +532,164 @@ async def chat_completions(request: Request):
             }],
             "usage": final_usage
         }
+
+
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic 兼容消息接口（兼容 Claude Code 的 /v1/messages 调用）。"""
+    body = await request.json()
+    model = body.get("model", DEFAULT_MODEL)
+    is_stream = body.get("stream", False)
+
+    messages_raw = body.get("messages", [])
+    messages, files = _normalize_anthropic_messages(messages_raw)
+
+    system_prompt = _anthropic_system_to_text(body.get("system", ""))
+    if messages and messages[0].get("role") == "system":
+        extra_system = messages[0].get("content", "")
+        if extra_system:
+            system_prompt = f"{system_prompt}\n\n{extra_system}".strip() if system_prompt else extra_system
+        messages = messages[1:]
+
+    user_text = _build_user_text(messages, system_prompt)
+    if not isinstance(user_text, str) or not user_text:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "无法解析用户消息"},
+            },
+        )
+
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    if is_stream:
+        async def anthropic_stream_generator():
+            final_usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+
+            yield _anthropic_sse(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                },
+            )
+            yield _anthropic_sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            )
+
+            async for event in _proxy_chat_events(
+                model=model,
+                system_prompt=system_prompt,
+                user_text=user_text,
+                files=files,
+            ):
+                if event["type"] == "content":
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": event["data"]},
+                        },
+                    )
+                elif event["type"] == "reasoning":
+                    yield _anthropic_sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": "\n[thinking] " + event["data"]},
+                        },
+                    )
+                elif event["type"] == "usage":
+                    final_usage = event["data"]
+                elif event["type"] == "error":
+                    yield _anthropic_sse(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {"type": "api_error", "message": event["data"]},
+                        },
+                    )
+                    return
+
+            yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            yield _anthropic_sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": _anthropic_usage_from_openai(final_usage),
+                },
+            )
+            yield _anthropic_sse("message_stop", {"type": "message_stop"})
+
+        return StreamingResponse(anthropic_stream_generator(), media_type="text/event-stream")
+
+    full_content = ""
+    full_reasoning = ""
+    final_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    async for event in _proxy_chat_events(
+        model=model,
+        system_prompt=system_prompt,
+        user_text=user_text,
+        files=files,
+    ):
+        if event["type"] == "content":
+            full_content += event["data"]
+        elif event["type"] == "reasoning":
+            full_reasoning += event["data"]
+        elif event["type"] == "usage":
+            final_usage = event["data"]
+        elif event["type"] == "error":
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "type": "error",
+                    "error": {"type": "api_error", "message": event["data"]},
+                },
+            )
+
+    if full_reasoning:
+        if full_content:
+            full_content = f"{full_content}\n\n[thinking]\n{full_reasoning}"
+        else:
+            full_content = f"[thinking]\n{full_reasoning}"
+
+    return {
+        "id": message_id,
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": full_content}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": _anthropic_usage_from_openai(final_usage),
+    }
 
 
 # ============================================================
