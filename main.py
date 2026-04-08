@@ -6,7 +6,6 @@ import json
 import asyncio
 import uuid
 import os
-import time
 import logging
 from typing import Optional
 
@@ -18,17 +17,22 @@ from fastapi.responses import StreamingResponse
 #  配置区
 # ============================================================
 BASE_URL = "https://acai.krxxl.cn/api"
+UPSTREAM_ORIGIN = "https://acai.krxxl.cn"
 AUTH_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
     ".eyJ1c2VySWQiOjEwMTI4LCJzaWduIjoiNGEwMTE3MmI3MjU3NzIxNDk3ODZiMTQ3N2Q2MmQ4ZjQiLCJyb2xlIjoidXNlciIsImV4cCI6MTc3ODI5NDA3NywibmJmIjoxNzc1NjE1Njc3LCJpYXQiOjE3NzU2MTU2Nzd9"
     ".ZSfbbPd5b0X72Wn6yuWt915Q4EU0u-ZX9nk5kwQEymU"
 )
-SESSION_IDS = [395815, 395816, 395817, 395818, 399225, 399226, 399227, 399228]
+SESSION_IDS_RAW = os.getenv("ACAI_SESSION_IDS", "399226")
+SESSION_IDS = [int(x.strip()) for x in SESSION_IDS_RAW.split(",") if x.strip().isdigit()]
+if not SESSION_IDS:
+    SESSION_IDS = [399226]
 USER_ID = 10128
-DEFAULT_MODEL = "gemini-3.1-pro"
+DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 CHAT_TIMEOUT = 120.0
 GENERAL_TIMEOUT = 10.0
-HTTP_PROXY = os.getenv("HTTP_PROXY", None)  # 云端部署不需要默认本地代理
+HTTP_PROXY = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+ACAI_COOKIE = os.getenv("ACAI_COOKIE", "").strip()
 
 # ============================================================
 #  日志 & 应用初始化
@@ -47,18 +51,17 @@ for _sid in SESSION_IDS:
 # ============================================================
 #  工具函数
 # ============================================================
-def _headers() -> dict:
+def _headers(accept: str = "text/event-stream") -> dict:
     """构建上游请求头"""
-    return {
-        "Accept": "text/event-stream",
+    headers = {
+        "Accept": accept,
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Authorization": AUTH_TOKEN,
         "Connection": "keep-alive",
         "Content-Type": "application/json",
-        "Host": "={BASE_URL}".replace("https://", "").replace("http://", ""),
-        "Origin": f"{BASE_URL}",
-        "Referer": f"{BASE_URL}/chat",
+        "Origin": UPSTREAM_ORIGIN,
+        "Referer": f"{UPSTREAM_ORIGIN}/chat",
         "Sec-CH-UA": '"Chromium";v="135", "Not-A.Brand";v="8"',
         "Sec-CH-UA-Mobile": "?0",
         "Sec-CH-UA-Platform": '"Windows"',
@@ -66,9 +69,22 @@ def _headers() -> dict:
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-        "X-App-Version": "2.14.0",
-        "Cookie": "https_waf_cookie=e4e69a92-20ee-43cc06206731146a69124d8217c38ac4962e"
+        "X-APP-VERSION": "2.14.0",
     }
+    if ACAI_COOKIE:
+        headers["Cookie"] = ACAI_COOKIE if "=" in ACAI_COOKIE else f"https_waf_cookie={ACAI_COOKIE}"
+    return headers
+
+
+def _client_kwargs(timeout: float, follow_redirects: bool = False) -> dict:
+    kwargs = {
+        "verify": False,
+        "timeout": timeout,
+        "follow_redirects": follow_redirects,
+    }
+    if HTTP_PROXY:
+        kwargs["proxy"] = HTTP_PROXY
+    return kwargs
 
 
 def _wrap_chunk(
@@ -117,9 +133,9 @@ def _build_user_text(messages: list,system_prompt) -> str:
 async def fetch_remote_models() -> list[dict]:
     """从上游获取可用模型列表"""
     url = f"{BASE_URL}/chat/tmpl"
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=GENERAL_TIMEOUT, proxy=HTTP_PROXY) as client:
+    async with httpx.AsyncClient(**_client_kwargs(GENERAL_TIMEOUT, follow_redirects=True)) as client:
         try:
-            resp = await client.get(url, headers=_headers())
+            resp = await client.get(url, headers=_headers("application/json, text/plain, */*"))
             if resp.status_code != 200:
                 logger.warning("获取模型列表失败: HTTP %d", resp.status_code)
                 return []
@@ -150,8 +166,8 @@ async def change_session(
     target_session_id: int,
     model: str = DEFAULT_MODEL,
     system_prompt: str = "",
-    plugins: Optional[list] = [],#['google'],
-    mcp: Optional[list] = [],#['search-the-web'],
+    plugins: Optional[list] = None,
+    mcp: Optional[list] = None,
 ) -> dict:
     """修改上游会话配置（模型/提示词/插件/MCP）"""
     url = f"{BASE_URL}/chat/session/{target_session_id}"
@@ -170,26 +186,31 @@ async def change_session(
         "prompt": system_prompt,
         "topSort": 0,
         "icon": "",
-        "plugins": plugins,
-        "mcp": mcp,
+        "plugins": plugins or [],
+        "mcp": mcp or [],
         "localPlugins": None,
         "useAppId": 0,
     }
-    async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=GENERAL_TIMEOUT, proxy=HTTP_PROXY) as client:
+    async with httpx.AsyncClient(**_client_kwargs(GENERAL_TIMEOUT, follow_redirects=True)) as client:
         try:
-            resp = await client.put(url, headers=_headers(), json=payload)
-            resp_json = resp.json()
+            resp = await client.put(url, headers=_headers("application/json, text/plain, */*"), json=payload)
+            try:
+                resp_json = resp.json()
+            except json.JSONDecodeError:
+                logger.warning("修改会话返回非 JSON: HTTP %d, body=%s", resp.status_code, resp.text[:300])
+                return {"code": 1, "msg": "upstream non-json response"}
+
             if resp.status_code == 200 and resp_json.get("code") == 0:
                 logger.info(
                     "会话 %d 配置已更新 | model=%s | plugins=%s | mcp=%s",
-                    target_session_id, model, plugins, mcp,
+                    target_session_id, model, plugins or [], mcp or [],
                 )
                 return resp_json
-            logger.warning("修改会话失败: HTTP %d, body=%s", resp.status_code, resp.text[:200])
-            return {"code": 1, "msg": "upstream error"}
+            logger.warning("修改会话失败: HTTP %d, body=%s", resp.status_code, resp.text[:300])
+            return {"code": 1, "msg": f"upstream session http {resp.status_code}"}
         except Exception as e:
-            logger.error("修改会话异常: %s", e)
-            return {"code": 1, "msg": str(e)}
+            logger.error("修改会话异常: %r", e)
+            return {"code": 1, "msg": repr(e)}
 
 
 # ============================================================
@@ -240,6 +261,7 @@ async def chat_completions(request: Request):
 
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+    import time
     created_time = int(time.time())
 
     async def _event_generator():
@@ -250,11 +272,17 @@ async def chat_completions(request: Request):
 
             t0 = time.time()
             # 1. 修改上游会话配置
-            await change_session(
+            session_result = await change_session(
                 target_session_id=selected_session_id,
                 model=model,
                 system_prompt=system_prompt,
             )
+            if session_result.get("code") != 0:
+                yield {
+                    "type": "error",
+                    "data": f"upstream session update failed (sessionId={selected_session_id}): {session_result.get('msg', 'unknown')}",
+                }
+                return
             t1 = time.time()
             logger.info(f"修改上游会话配置耗时: {t1 - t0:.3f} 秒")
             await asyncio.sleep(0.1)  # 等待配置生效
@@ -262,8 +290,12 @@ async def chat_completions(request: Request):
             # 2. 发起流式聊天请求
             payload = {"sessionId": selected_session_id, "text": user_text, "files": files}
             t2 = time.time()
-            async with httpx.AsyncClient(verify=False, timeout=CHAT_TIMEOUT, proxy=HTTP_PROXY) as client:
+            async with httpx.AsyncClient(**_client_kwargs(CHAT_TIMEOUT)) as client:
                 async with client.stream("POST", f"{BASE_URL}/chat/completions", headers=_headers(), json=payload) as resp:
+                    if resp.status_code != 200:
+                        upstream_body = (await resp.aread()).decode("utf-8", errors="ignore")
+                        raise RuntimeError(f"upstream completions http {resp.status_code}: {upstream_body[:300]}")
+
                     logger.info(f"上游接通耗时 (TTFB 之前/建连等): {time.time() - t2:.3f} 秒")
                     buffer = ""
                     is_thinking = False
@@ -288,7 +320,7 @@ async def chat_completions(request: Request):
 
                                 try:
                                     obj = json.loads(raw_str)
-                                except json.JSONDecodeError as e:
+                                except json.JSONDecodeError:
                                     continue
 
                                 # --- 错误处理 ---
@@ -333,8 +365,8 @@ async def chat_completions(request: Request):
                         logger.warning("上游连接提前关闭 (incomplete chunked read)，已收集的数据仍有效")
 
         except Exception as e:
-            logger.error("生成异常: %s", e)
-            yield {"type": "error", "data": str(e)}
+            logger.error("生成异常: %r", e)
+            yield {"type": "error", "data": str(e) or repr(e)}
         finally:
             if selected_session_id is not None:
                 session_pool.put_nowait(selected_session_id)
@@ -353,7 +385,6 @@ async def chat_completions(request: Request):
                     yield f"data: {json.dumps({'error': {'message': event['data']}})}\n\n"
             yield "data: [DONE]\n\n"
         
-        from fastapi.responses import StreamingResponse
         return StreamingResponse(stream_generator(), media_type="text/event-stream")
     else:
         # 非流式处理
@@ -399,8 +430,7 @@ async def chat_completions(request: Request):
 # ============================================================
 if __name__ == "__main__":
     import uvicorn
-    # 强制监听 0.0.0.0，并获取 Render 默认提供的 PORT 环境变量
-    host = os.getenv("API_HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "10000")) 
-    uvicorn.run(app, host=host, port=port)
 
+    host = os.getenv("API_HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", os.getenv("API_PORT", "10000")))
+    uvicorn.run(app, host=host, port=port)
