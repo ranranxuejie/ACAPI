@@ -17,11 +17,11 @@ from fastapi.responses import StreamingResponse
 # ============================================================
 #  配置区
 # ============================================================
-BASE_URL = "https://acai.9vvn.com/api"
+BASE_URL = "https://acai.krxxl.cn/api"
 AUTH_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
-    ".eyJ1c2VySWQiOjEwMTI4LCJzaWduIjoiNGEwMTE3MmI3MjU3NzIxNDk3ODZiMTQ3N2Q2MmQ4ZjQiLCJyb2xlIjoidXNlciIsImV4cCI6MTc3NTg3MTY5OCwibmJmIjoxNzczMTkzMjk4LCJpYXQiOjE3NzMxOTMyOTh9"
-    ".mX0Hnl020azUR2mszFnOrpK62TXeL4Yegpl1IKuohyk"
+    ".eyJ1c2VySWQiOjEwMTI4LCJzaWduIjoiNGEwMTE3MmI3MjU3NzIxNDk3ODZiMTQ3N2Q2MmQ4ZjQiLCJyb2xlIjoidXNlciIsImV4cCI6MTc3ODI5NDA3NywibmJmIjoxNzc1NjE1Njc3LCJpYXQiOjE3NzU2MTU2Nzd9"
+    ".ZSfbbPd5b0X72Wn6yuWt915Q4EU0u-ZX9nk5kwQEymU"
 )
 SESSION_IDS = [395815, 395816, 395817, 395818, 399225, 399226, 399227, 399228]
 USER_ID = 10128
