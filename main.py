@@ -14,6 +14,13 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+from protocols.openai_compat import handle_chat_completions
+from protocols.anthropic_compat import handle_messages as handle_anthropic_messages
+from protocols.gemini_compat import (
+    handle_generate_content,
+    handle_stream_generate_content,
+)
+
 # ============================================================
 #  配置区
 # ============================================================
@@ -237,6 +244,119 @@ def _anthropic_sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _gemini_system_to_text(system_value: Any) -> str:
+    """把 Gemini 的 systemInstruction 字段统一成字符串。"""
+    if isinstance(system_value, str):
+        return system_value
+    if not isinstance(system_value, dict):
+        return ""
+
+    parts = system_value.get("parts", [])
+    if not isinstance(parts, list):
+        return ""
+
+    texts: list[str] = []
+    for part in parts:
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            texts.append(part.get("text", ""))
+    return "\n".join([x for x in texts if x])
+
+
+def _normalize_gemini_contents(contents: list) -> tuple[list, list[dict]]:
+    """标准化 Gemini contents，并提取可直接转发的内联附件。"""
+    normalized: list = []
+    files: list[dict] = []
+
+    for item in contents:
+        if not isinstance(item, dict):
+            continue
+
+        role_raw = item.get("role", "user")
+        role = "assistant" if role_raw == "model" else role_raw
+
+        parts = item.get("parts", [])
+        texts: list[str] = []
+        if isinstance(parts, list):
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if isinstance(part.get("text"), str):
+                    texts.append(part.get("text", ""))
+
+                inline_data = part.get("inlineData")
+                if isinstance(inline_data, dict):
+                    data = inline_data.get("data", "")
+                    if data:
+                        mime_type = inline_data.get("mimeType", "application/octet-stream")
+                        suffix = str(mime_type).split("/")[-1] if "/" in str(mime_type) else "bin"
+                        files.append({"name": f"inline.{suffix}", "data": data})
+
+        normalized.append({
+            "role": role,
+            "content": "\n".join(texts),
+        })
+
+    return normalized, files
+
+
+def _gemini_usage_from_openai(usage: Optional[dict]) -> dict:
+    """将 OpenAI usage 字段映射到 Gemini usageMetadata。"""
+    usage = usage or {}
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or (prompt_tokens + completion_tokens))
+    return {
+        "promptTokenCount": prompt_tokens,
+        "candidatesTokenCount": completion_tokens,
+        "totalTokenCount": total_tokens,
+    }
+
+
+def _gemini_sse(payload: dict) -> str:
+    """包装 Gemini SSE 数据块。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _prepare_gemini_proxy_input(body: dict, model_name: str):
+    """将 Gemini 请求体转为统一上游入参。"""
+    raw_model = body.get("model", model_name)
+    if isinstance(raw_model, str) and raw_model.strip():
+        model = raw_model.strip()
+    else:
+        model = model_name or DEFAULT_MODEL
+    if model.startswith("models/"):
+        model = model.split("/", 1)[1]
+
+    contents_raw = body.get("contents", [])
+    if not isinstance(contents_raw, list):
+        contents_raw = []
+    messages, files = _normalize_gemini_contents(contents_raw)
+
+    system_raw = body.get("systemInstruction", body.get("system_instruction", ""))
+    system_prompt = _gemini_system_to_text(system_raw)
+
+    if messages and messages[0].get("role") == "system":
+        extra_system = messages[0].get("content", "")
+        if extra_system:
+            system_prompt = f"{system_prompt}\n\n{extra_system}".strip() if system_prompt else extra_system
+        messages = messages[1:]
+
+    user_text = _build_user_text(messages, system_prompt)
+    if not isinstance(user_text, str) or not user_text:
+        return model, "", "", files, JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": 400,
+                    "message": "Invalid Gemini request: empty contents",
+                    "status": "INVALID_ARGUMENT",
+                }
+            },
+        )
+
+    return model, user_text, system_prompt, files, None
+
+
 async def _proxy_chat_events(
     model: str,
     system_prompt: str,
@@ -451,245 +571,53 @@ async def list_models():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    """OpenAI 兼容的对话补全接口（流式/非流式）"""
     body = await request.json()
-    model = body.get("model", DEFAULT_MODEL)
-    messages_raw = body.get("messages", [])
-    is_stream = body.get("stream", False)
-
-    messages, files = _normalize_openai_messages(messages_raw)
-
-    # 提取 system prompt（如果第一条是 system 角色）
-    system_prompt = ""
-    if messages and messages[0].get("role") == "system":
-        system_prompt = messages[0].get("content", "")
-        messages = messages[1:]
-
-    user_text = _build_user_text(messages,system_prompt)
-    if not isinstance(user_text, str) or not user_text:
-        return {"error": {"message": "无法解析用户消息"}}
-
-    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created_time = int(time.time())
-
-    if is_stream:
-        async def stream_generator():
-            async for event in _proxy_chat_events(
-                model=model,
-                system_prompt=system_prompt,
-                user_text=user_text,
-                files=files,
-            ):
-                if event["type"] == "content":
-                    yield _wrap_chunk(model, chunk_id, content=event["data"])
-                elif event["type"] == "reasoning":
-                    yield _wrap_chunk(model, chunk_id, reasoning=event["data"])
-                elif event["type"] == "usage":
-                    yield _wrap_chunk(model, chunk_id, usage=event["data"])
-                elif event["type"] == "error":
-                    yield f"data: {json.dumps({'error': {'message': event['data']}})}\n\n"
-            yield "data: [DONE]\n\n"
-        
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    else:
-        # 非流式处理
-        full_content = ""
-        full_reasoning = ""
-        final_usage = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0
-        }
-        
-        async for event in _proxy_chat_events(
-            model=model,
-            system_prompt=system_prompt,
-            user_text=user_text,
-            files=files,
-        ):
-            if event["type"] == "content":
-                full_content += event["data"]
-            elif event["type"] == "reasoning":
-                full_reasoning += event["data"]
-            elif event["type"] == "usage":
-                final_usage = event["data"]
-            elif event["type"] == "error":
-                return JSONResponse(status_code=500, content={"error": {"message": event["data"]}})
-                
-        message = {"role": "assistant", "content": full_content}
-        if full_reasoning:
-            message["reasoning_content"] = full_reasoning
-            
-        return {
-            "id": chunk_id,
-            "object": "chat.completion",
-            "created": created_time,
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": "stop"
-            }],
-            "usage": final_usage
-        }
+    return await handle_chat_completions(
+        body=body,
+        default_model=DEFAULT_MODEL,
+        build_user_text=_build_user_text,
+        extract_text_and_files=_extract_text_and_files,
+        proxy_chat_events=_proxy_chat_events,
+        wrap_chunk=_wrap_chunk,
+    )
 
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
-    """Anthropic 兼容消息接口（兼容 Claude Code 的 /v1/messages 调用）。"""
     body = await request.json()
-    model = body.get("model", DEFAULT_MODEL)
-    is_stream = body.get("stream", False)
+    return await handle_anthropic_messages(
+        body=body,
+        default_model=DEFAULT_MODEL,
+        build_user_text=_build_user_text,
+        extract_text_and_files=_extract_text_and_files,
+        proxy_chat_events=_proxy_chat_events,
+    )
 
-    messages_raw = body.get("messages", [])
-    messages, files = _normalize_anthropic_messages(messages_raw)
 
-    system_prompt = _anthropic_system_to_text(body.get("system", ""))
-    if messages and messages[0].get("role") == "system":
-        extra_system = messages[0].get("content", "")
-        if extra_system:
-            system_prompt = f"{system_prompt}\n\n{extra_system}".strip() if system_prompt else extra_system
-        messages = messages[1:]
+@app.post("/v1beta/models/{model_name}:generateContent")
+@app.post("/v1/models/{model_name}:generateContent")
+async def gemini_generate_content(model_name: str, request: Request):
+    body = await request.json()
+    return await handle_generate_content(
+        model_name=model_name,
+        body=body,
+        default_model=DEFAULT_MODEL,
+        build_user_text=_build_user_text,
+        proxy_chat_events=_proxy_chat_events,
+    )
 
-    user_text = _build_user_text(messages, system_prompt)
-    if not isinstance(user_text, str) or not user_text:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": "无法解析用户消息"},
-            },
-        )
 
-    message_id = f"msg_{uuid.uuid4().hex[:24]}"
-
-    if is_stream:
-        async def anthropic_stream_generator():
-            final_usage = {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            }
-
-            yield _anthropic_sse(
-                "message_start",
-                {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    },
-                },
-            )
-            yield _anthropic_sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
-
-            async for event in _proxy_chat_events(
-                model=model,
-                system_prompt=system_prompt,
-                user_text=user_text,
-                files=files,
-            ):
-                if event["type"] == "content":
-                    yield _anthropic_sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": event["data"]},
-                        },
-                    )
-                elif event["type"] == "reasoning":
-                    yield _anthropic_sse(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": "\n[thinking] " + event["data"]},
-                        },
-                    )
-                elif event["type"] == "usage":
-                    final_usage = event["data"]
-                elif event["type"] == "error":
-                    yield _anthropic_sse(
-                        "error",
-                        {
-                            "type": "error",
-                            "error": {"type": "api_error", "message": event["data"]},
-                        },
-                    )
-                    return
-
-            yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": 0})
-            yield _anthropic_sse(
-                "message_delta",
-                {
-                    "type": "message_delta",
-                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                    "usage": _anthropic_usage_from_openai(final_usage),
-                },
-            )
-            yield _anthropic_sse("message_stop", {"type": "message_stop"})
-
-        return StreamingResponse(anthropic_stream_generator(), media_type="text/event-stream")
-
-    full_content = ""
-    full_reasoning = ""
-    final_usage = {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-    }
-
-    async for event in _proxy_chat_events(
-        model=model,
-        system_prompt=system_prompt,
-        user_text=user_text,
-        files=files,
-    ):
-        if event["type"] == "content":
-            full_content += event["data"]
-        elif event["type"] == "reasoning":
-            full_reasoning += event["data"]
-        elif event["type"] == "usage":
-            final_usage = event["data"]
-        elif event["type"] == "error":
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "type": "error",
-                    "error": {"type": "api_error", "message": event["data"]},
-                },
-            )
-
-    if full_reasoning:
-        if full_content:
-            full_content = f"{full_content}\n\n[thinking]\n{full_reasoning}"
-        else:
-            full_content = f"[thinking]\n{full_reasoning}"
-
-    return {
-        "id": message_id,
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": [{"type": "text", "text": full_content}],
-        "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": _anthropic_usage_from_openai(final_usage),
-    }
+@app.post("/v1beta/models/{model_name}:streamGenerateContent")
+@app.post("/v1/models/{model_name}:streamGenerateContent")
+async def gemini_stream_generate_content(model_name: str, request: Request):
+    body = await request.json()
+    return await handle_stream_generate_content(
+        model_name=model_name,
+        body=body,
+        default_model=DEFAULT_MODEL,
+        build_user_text=_build_user_text,
+        proxy_chat_events=_proxy_chat_events,
+    )
 
 
 # ============================================================
