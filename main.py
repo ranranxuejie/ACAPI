@@ -4,7 +4,6 @@ ACAI Proxy API - OpenAI 兼容代理
 """
 import json
 import asyncio
-import uuid
 import os
 import time
 import logging
@@ -12,7 +11,6 @@ from typing import Optional, Any, AsyncGenerator
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
 
 from protocols.openai_compat import handle_chat_completions
 from protocols.anthropic_compat import handle_messages as handle_anthropic_messages
@@ -171,190 +169,6 @@ def _extract_text_and_files(content: Any) -> tuple[str, list[dict]]:
                     files.append({"name": f"{item_type}.{suffix}", "data": data})
 
     return "\n".join(texts), files
-
-
-def _normalize_openai_messages(messages: list) -> tuple[list, list[dict]]:
-    """标准化 OpenAI 消息格式，并收集附件。"""
-    normalized: list = []
-    files: list[dict] = []
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        text, msg_files = _extract_text_and_files(msg.get("content", ""))
-        files.extend(msg_files)
-        normalized.append({
-            "role": msg.get("role", "user"),
-            "content": text,
-        })
-
-    return normalized, files
-
-
-def _anthropic_system_to_text(system_value: Any) -> str:
-    """把 Anthropic 的 system 字段统一成字符串。"""
-    if isinstance(system_value, str):
-        return system_value
-    if isinstance(system_value, dict):
-        if system_value.get("type") == "text":
-            return str(system_value.get("text", ""))
-        return ""
-    if isinstance(system_value, list):
-        parts: list[str] = []
-        for item in system_value:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text", "")))
-        return "\n".join([p for p in parts if p])
-    return ""
-
-
-def _normalize_anthropic_messages(messages: list) -> tuple[list, list[dict]]:
-    """标准化 Anthropic 消息格式，并收集附件。"""
-    normalized: list = []
-    files: list[dict] = []
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        text, msg_files = _extract_text_and_files(msg.get("content", ""))
-        files.extend(msg_files)
-        normalized.append({
-            "role": msg.get("role", "user"),
-            "content": text,
-        })
-
-    return normalized, files
-
-
-def _anthropic_usage_from_openai(usage: Optional[dict]) -> dict:
-    """将 OpenAI usage 字段映射到 Anthropic usage。"""
-    usage = usage or {}
-    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-    return {
-        "input_tokens": prompt_tokens,
-        "output_tokens": completion_tokens,
-    }
-
-
-def _anthropic_sse(event: str, payload: dict) -> str:
-    """包装 Anthropic SSE 事件。"""
-    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _gemini_system_to_text(system_value: Any) -> str:
-    """把 Gemini 的 systemInstruction 字段统一成字符串。"""
-    if isinstance(system_value, str):
-        return system_value
-    if not isinstance(system_value, dict):
-        return ""
-
-    parts = system_value.get("parts", [])
-    if not isinstance(parts, list):
-        return ""
-
-    texts: list[str] = []
-    for part in parts:
-        if isinstance(part, dict) and isinstance(part.get("text"), str):
-            texts.append(part.get("text", ""))
-    return "\n".join([x for x in texts if x])
-
-
-def _normalize_gemini_contents(contents: list) -> tuple[list, list[dict]]:
-    """标准化 Gemini contents，并提取可直接转发的内联附件。"""
-    normalized: list = []
-    files: list[dict] = []
-
-    for item in contents:
-        if not isinstance(item, dict):
-            continue
-
-        role_raw = item.get("role", "user")
-        role = "assistant" if role_raw == "model" else role_raw
-
-        parts = item.get("parts", [])
-        texts: list[str] = []
-        if isinstance(parts, list):
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
-                if isinstance(part.get("text"), str):
-                    texts.append(part.get("text", ""))
-
-                inline_data = part.get("inlineData")
-                if isinstance(inline_data, dict):
-                    data = inline_data.get("data", "")
-                    if data:
-                        mime_type = inline_data.get("mimeType", "application/octet-stream")
-                        suffix = str(mime_type).split("/")[-1] if "/" in str(mime_type) else "bin"
-                        files.append({"name": f"inline.{suffix}", "data": data})
-
-        normalized.append({
-            "role": role,
-            "content": "\n".join(texts),
-        })
-
-    return normalized, files
-
-
-def _gemini_usage_from_openai(usage: Optional[dict]) -> dict:
-    """将 OpenAI usage 字段映射到 Gemini usageMetadata。"""
-    usage = usage or {}
-    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
-    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
-    total_tokens = int(usage.get("total_tokens", prompt_tokens + completion_tokens) or (prompt_tokens + completion_tokens))
-    return {
-        "promptTokenCount": prompt_tokens,
-        "candidatesTokenCount": completion_tokens,
-        "totalTokenCount": total_tokens,
-    }
-
-
-def _gemini_sse(payload: dict) -> str:
-    """包装 Gemini SSE 数据块。"""
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-def _prepare_gemini_proxy_input(body: dict, model_name: str):
-    """将 Gemini 请求体转为统一上游入参。"""
-    raw_model = body.get("model", model_name)
-    if isinstance(raw_model, str) and raw_model.strip():
-        model = raw_model.strip()
-    else:
-        model = model_name or DEFAULT_MODEL
-    if model.startswith("models/"):
-        model = model.split("/", 1)[1]
-
-    contents_raw = body.get("contents", [])
-    if not isinstance(contents_raw, list):
-        contents_raw = []
-    messages, files = _normalize_gemini_contents(contents_raw)
-
-    system_raw = body.get("systemInstruction", body.get("system_instruction", ""))
-    system_prompt = _gemini_system_to_text(system_raw)
-
-    if messages and messages[0].get("role") == "system":
-        extra_system = messages[0].get("content", "")
-        if extra_system:
-            system_prompt = f"{system_prompt}\n\n{extra_system}".strip() if system_prompt else extra_system
-        messages = messages[1:]
-
-    user_text = _build_user_text(messages, system_prompt)
-    if not isinstance(user_text, str) or not user_text:
-        return model, "", "", files, JSONResponse(
-            status_code=400,
-            content={
-                "error": {
-                    "code": 400,
-                    "message": "Invalid Gemini request: empty contents",
-                    "status": "INVALID_ARGUMENT",
-                }
-            },
-        )
-
-    return model, user_text, system_prompt, files, None
 
 
 async def _proxy_chat_events(
